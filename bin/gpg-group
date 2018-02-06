@@ -1,0 +1,344 @@
+#!/usr/bin/env bash
+
+die() {
+	echo "gpg-group: ERROR: ${FUNCNAME[1]}: $1" >&2
+	exit 1
+}
+
+##################################################
+# Methods
+##################################################
+
+pick_group()
+{
+    local group="$1"
+    if [[ -z "$group" ]]; then
+        PS3='Select group: '
+        select group in $(cmd_groups); do
+            [[ "$group" ]] && break
+        done
+    fi
+
+    has_group "$group" || die "Invalid group: $group"
+    printf "%s" "$group"
+}
+
+pick_key() {
+    local fprs uids choice i
+
+    if [[ -z "$1" ]]; then
+        printf 'No keys to choose from!\n' >&2
+        read -r -p "$PS3"
+        printf '%s' "$REPLY"
+        return 1;
+    fi
+
+    mapfile -t fprs < <(fpr <<< "$1")
+    mapfile -t uids < <(uid <<< "$1")
+
+    select choice in "${uids[@]}"; do
+        [[ $choice ]] || break
+        for i in "${!uids[@]}"
+        do
+            if [[ "$choice" == "${uids[$i]}" ]]; then
+                printf '%s' "${fprs[$i]}"
+                return 0
+            fi;
+        done
+    done;
+    printf '%s' "$REPLY"
+    return 1
+}
+
+has_group() {
+    [[ -f "$homedir/$1" ]]
+}
+
+read_group() {
+    sed -e 's/#.*//g' -e '/^$/d' -e 's/[[:space:]]//g' < "$homedir/$1"
+}
+
+write_group() {
+    local group="$1"; shift
+
+    if (( $# > 0 )); then
+        list_keys "$@" |
+            valid_fpr_uid |
+            sort |
+            uniq -w 40 |
+            sort -k2 |
+            sed 's/ / # /' > "$homedir/$group"
+    else
+        true > "$homedir/$group"
+    fi
+}
+
+list_keys() {
+    gpg --list-public-keys --with-colons --with-fingerprint "$@"
+}
+
+valid_fpr_uid() {
+    awk -F: '
+        /^pub:/{ VALID = $2};
+        /^fpr:/{ FPR = $10 };
+        /^uid:/{ if(VALID != "e" && $2 != "e") {print FPR " " $10;} ; }'
+}
+
+without_keys() {
+    if (("$#")) ; then
+        grep -vf <(printf '^%s\n' "$@")
+    else
+        cat
+    fi
+}
+
+uid() {
+    cut -d" " -f 2-
+}
+
+fpr() {
+    cut -d" " -f 1
+}
+
+is_clean() {
+    local group="$1"; shift
+    diff -q <(read_group "$group" | sort ) \
+        <( (($#)) && printf '%s\n' "$@" | sort) > /dev/null
+}
+
+##################################################
+# Commands
+##################################################
+
+cmd_usage() {
+    echo "usage"
+}
+
+cmd_groups() {
+    local group;
+    for group in "$homedir"/*; do
+        printf '%s\n' "${group##*/}"
+    done;
+}
+
+cmd_show() {
+    if [[ "$1" = "-f" ]];
+        then display=fpr; shift; else display=uid;
+    fi
+    group=$(pick_group "$1")
+    mapfile -t selected < <(read_group "$group")
+    (( ${#selected[@]} > 0 )) && list_keys "${selected[@]}" | valid_fpr_uid | $display
+}
+
+cmd_prune() {
+    noact=false
+    if [[ "$1" = "-n" ]]; then
+        noact=true; shift
+    fi
+
+    group=$(pick_group "$1")
+
+    mapfile -t selected < <(read_group "$group")
+    mapfile -t active < <(cmd_show -f "$group")
+
+    (( "${#selected[@]}" == "${#active[@]}" )) && return 1
+
+    for s in "${selected[@]}"; do
+        for a in "${active[@]}"; do
+            [[ "$s" = "$a" ]] && continue 2
+        done
+
+        printf '%s\n' "$s"
+
+    done
+    $noact || write_group "$group" "${selected[@]}"
+}
+
+cmd_edit() {
+    group=$(pick_group "$1")
+
+    mapfile -t selected < <(read_group "$group")
+
+    menu="[A]dd, [S]ave, [C]opy, [D]elete, [Q]uit: "
+    while true; do
+        if is_clean "$group" "${selected[@]}"
+            then dirty=""; else dirty="*"
+        fi
+        printf 'Edit group "%s"%s (%s keys)\n' "$group" "$dirty" ${#selected[@]} >&2
+        keys=''; PS3="$menu"
+        if (("${#selected[@]}" > 1)); then
+            keys=$(list_keys "${selected[@]}" | valid_fpr_uid)
+            PS3="[#] Remove key, $menu"
+        fi
+        if fpr=$(pick_key "${keys[@]}"); then
+            # Remove fpr from group
+            for s in "${!selected[@]}"; do
+                [[ ${selected[$s]} = "$fpr" ]] && unset 'selected[s]'
+            done
+        else
+            case "$fpr" in
+                A|a) # Add fpr to group
+                    read -r -p 'Search [type "C" to cancel]: ' query
+                    [[ "$query" == "C" ]] && continue;
+                    found=$(list_keys "$query" | valid_fpr_uid | without_keys "${selected[@]}")
+                    PS3="Add to $group [C to cancel]: "
+                    fpr=$(pick_key "${found[@]}") && selected+=("$fpr")
+                    ;;
+                S|s) # Save group
+                    write_group "$group" "${selected[@]}"
+                    ;;
+                Q|q) # Quit
+                    is_clean "$group" "${selected[@]}" && exit
+                    read -r -p 'Changes not saved! Are you sure? [y/N]: '
+                    [[ "$REPLY" = 'y' ]] && exit
+                    ;;
+                D|d) # Delete group
+                    read -r -p "Delete $group? [y/N]: "
+                    [[ "$REPLY" = 'y' ]] && rm "$homedir/$group" && exit
+                    ;;
+                C|c) # Copy group
+                    name=''
+                    while [[ -z "$name" ]] ; do
+                        read -r -p "Enter name for new group copy: " name
+                        has_group "$name" && unset name
+                    done
+                    write_group "$name" "${selected[@]}"
+                    ;;
+                *) printf 'Invalid Choice\n';
+            esac
+        fi
+        printf '\n'
+    done;
+}
+
+cmd_new() {
+    if [[ -z "$1" ]]; then
+        read -r -p "Enter name for new group: " name
+    else
+        name=$1
+    fi
+    has_group "$name" && die "Group '$name' already exists"
+    touch "$homedir/$name"
+    cmd_edit "$name"
+}
+
+cmd_encrypt() {
+
+    groups=()
+
+    while :; do
+        case "$1" in
+            -g)
+                if [ "$2" ]; then
+                    groups+=("$2")
+                    shift
+                else
+                    die '"--group" requires a non-empty option argument.'
+                fi
+                ;;
+            --group=?*)
+                group+=("${1#*=}")
+                ;;
+            --group=)
+                die '"--group" requires a non-empty option argument.'
+                ;;
+            --)  shift ; break ;;
+            -?*) printf 'WARN: Unknown option (ignored): %s\n' "$1" >&2 ;;
+            *)   break
+        esac
+        shift
+    done
+
+    for g in "${!groups[@]}"; do
+        if ! has_group "${groups[$g]}"; then
+            printf 'Invalid group %s\n' "${groups[$g]}" >&2
+            unset 'groups[g]'
+        fi
+    done
+
+    if (( "${#groups[@]}" < 1 )); then
+        die "No groups. Aborting"
+    fi
+
+    rcpt=()
+    for group in "${groups[@]}"; do
+        while read -r line; do
+            [[ -z "$line" ]] || rcpt+=("$line")
+        done < <(read_group "$group")
+    done
+
+    ((${#rcpt[@]})) && mapfile -t rcpt < <(printf '%s\n' "${rcpt[@]}" | sort | uniq)
+
+    if (( "${#rcpt[@]}" < 1 )); then
+        die "No recipients. Aborting"
+    fi
+
+    rcpt_flags=( "${rcpt[@]/#/-r }" )
+
+    for file in "$@"; do
+        if [[ -d "$file" ]]; then
+            archive="${file%/}".zip
+            output="$archive".gpg
+            zip -r - "$file" |
+                gpg --set-filename "$archive" -e "${rcpt_flags[@]}" -o "$output"
+        else
+            output="${file%/}".gpg
+            gpg -e "${rcpt_flags[@]}" -o "$output" "$file"
+        fi
+    done
+}
+
+##################################################
+# Main
+##################################################
+
+
+## Global options
+verbose=0
+XDG_DATA_HOME="${XDG_DATA_HOME:-$HOME/.local/share}"
+homedir="${GPG_GROUPS:-$XDG_DATA_HOME/gpg-groups}"
+
+gpg="$(command -v gpg || command -v gpg2)"
+if [[ -z ${gpg} && ! -x ${gpg} ]] ; then die "GnuPG is not available" ; fi
+
+while :; do
+    case "$1" in
+        -v|--verbose) verbose=$((verbose + 1)) ;; # Each -v adds 1 to verbosity.
+        --homedir)
+            if [ "$2" ]; then
+                homedir=$2
+                shift
+            else
+                die '"--homedir" requires a non-empty option argument.'
+            fi
+            ;;
+        --homedir=?*)
+            homedir=${1#*=}
+            ;;
+        --homedir=)
+            die '"--homedir" requires a non-empty option argument.'
+            ;;
+        --)  shift ; break ;;
+        -?*) printf 'WARN: Unknown option (ignored): %s\n' "$1" >&2 ;;
+        *)   break
+    esac
+    shift
+done
+
+if [[ ! -d "$homedir" ]]; then
+    mkdir -p "$homedir"
+fi
+
+cmd="$1"
+shift
+
+case "$cmd" in
+    groups)   cmd_groups ;;
+    show)     cmd_show "$@";;
+    edit)     cmd_edit "$@";;
+    new)      cmd_new "$@";;
+    encrypt)  cmd_encrypt "$@";;
+    prune)    cmd_prune "$@";;
+    *) cmd_usage ;;
+esac
+
