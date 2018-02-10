@@ -1,25 +1,116 @@
-#!/usr/bin/env bash
+#!/bin/bash
 #
-# Manage and encrypt to groups of Gnupg keys
+# Interactively manage GnuPG groups
 #
 
+##################################################
+# Global State
+##################################################
+group_names=()
+member_lists=()
 
 ##################################################
 # User Interface
 ##################################################
 
+show_help() {
+self=${0##*/}
+cat << EOF
+NAME
+    $self - interactively manage GnuPG groups
+USAGE
+    $self --help
+    $self groups
+    $self show [-f] NAME
+    $self edit NAME
+    $self new NAME
 
-# fun: die message
-# param: message: the message to ouptut to stdout
-# txt: prints to stdout and exits w/ 1
-die() {
-	echo "gpg-group: ERROR: ${FUNCNAME[1]}: $1" >&2
-	exit 1
+DESCRIPTION
+    Simple interactive interface for managing GnuPG groups via GPGCONF(1)
+
+    -h  display this help and exit
+
+COMMANDS
+
+    $self groups
+        list all group names defined in config
+
+    $self show [-f] NAME
+        show members of a group
+        -f      show fingerprints instead of uids
+        NAME    name of group to show
+
+    $self edit NAME
+        launch interactive editor for group. See EDITING GROUPS
+        NAME    name of group to edit
+
+    $self new NAME
+        create a new group and lauch interactive editor.
+        NAME    name of group to create
+
+EDITING GROUPS
+    The initial editor screen displays the name of the group you are currently
+    editing, the number of keys currently associated with the group, a
+    SELECT(3P) menu consisting of all the valid UID's represented by the
+    associated fingerprints, and a menu describing valid actions. An asterisk
+    (*) after the group name indicates that there are currently unsaved changes
+    to the group.
+
+    Entering the number of a UID from the select menu will remove that key from
+    the group. Other valid actions are:
+
+    A - Add a key to the group
+        When adding a key to a group, you will first be prompted for a string to
+        search for. This is passed to GPG(1) --list-keys. Only valid keys that
+        are not already in the group will be displayed. You will then be shown
+        another select menu displaying the UID's of the resulting keys. Entering
+        the number of a displayed UID will add the keys fingerprint to the
+        group. Your changes must still be saved.
+
+    S - Save all changes to groups
+        Any actions taken (add, remove, copy, delete) only alter in the in
+        memory state of the group aliases, and must be saved back to the
+        configuration file. Saving will attempt to persist the changes using
+        gpgconf and revert to the previous state if gpgconf reports an invalid
+        configuration
+
+    C - Copy a group to another name
+        Copying a group will copy the currently selected keys to a new group.
+        You will be prompted for the new name. The name of the new group must
+        not already exist. This is similar to a "save as" funciton, however,
+        your changes will still need to be saved using the save command.
+
+    D - Delete the current group
+        Deleting a group will remove the group from the configuration. You will
+        be prompted for confirmation. After confirmation, the editor will save
+        and quit.
+
+    Q - Quit the editor
+        When quitting the editor, if the groups configration in memory differes
+        from the persisted state of the groups, you will be prompted for
+        confirmation before loosing your changes.
+
+SEE ALSO
+    gpg(1), gpgconf(1)
+
+
+EOF
 }
 
-##################################################
-# Methods
-##################################################
+# fun: die msg
+# param: msg: message to display
+# txt: print msg to stdout and exit 1
+die() {
+    printf '%s\n' "$*" >&2
+    exit 1
+}
+
+# fun: err msg
+# param: msg: message to display
+# txt: print msg to stdout
+err() {
+    printf '%s\n' "$*" >&2
+}
 
 # fun: pick_group group
 # param: group: group to pick
@@ -28,9 +119,12 @@ die() {
 pick_group()
 {
     local group="$1"
+    local groups
+
     if [[ -z "$group" ]]; then
         PS3='Select group: '
-        select group in $(cmd_groups); do
+        mapfile -t groups < <(cmd_groups);
+        select group in "${groups[@]}"; do
             [[ "$group" ]] && break
         done
     fi
@@ -39,6 +133,7 @@ pick_group()
     printf "%s" "$group"
 }
 
+
 # fun: pick_key fpr_uids
 # param: fpr_uids: "fingerprint uid" lines to choose from
 # txt: interactive menu to select a fingerprint.
@@ -46,6 +141,8 @@ pick_group()
 #      returns 0 if fpr selected, or 1 if other selection
 pick_key() {
     local fprs uids choice i
+
+    printf '\n' >&2
 
     if [[ -z "$1" ]]; then
         printf 'No keys to choose from!\n' >&2
@@ -71,38 +168,222 @@ pick_key() {
     return 1
 }
 
-# fun: has_group group
-# param: group: group to check for existence
-# txt: checks if group exists
-has_group() {
-    [[ -f "$homedir/$1" ]]
+##################################################
+# GPGCONF Methods
+##################################################
+
+# fun: cfg_ok
+# txt: reads gpgconf response from stdin, displays errors and returns code
+cfg_ok()
+{
+    local name description avail okay cfgfile line error
+
+    while IFS=: read -r name description _ avail okay cfgfile line error; do
+        (( avail == 1 )) || err "$description not available"
+        (( okay == 1 )) && return 0
+        err "Error with $description config: '$error' in $cfgfile on $line"
+        return 1
+    done
 }
 
-# fun: read_group group
-# param: group: group to read keys from
-# txt: outputs fingerprints from group. removes comments and blank lines
-read_group() {
-    sed -e 's/#.*//g' -e '/^$/d' -e 's/[[:space:]]//g' < "$homedir/$1"
+# fun: get_conf_value
+# txt: prints the "alias list(37)" value for the groups config output
+#      see GPGCONF(1)
+get_conf_value() {
+    local -r conf=$(gpgconf --list-options gpg | grep ^group)
+    printf '%s' "${conf##*:}"
 }
 
-# fun: write_group group fingerprints
-# param: group: group name
-# param: fingerprints: fingerprints of group
-# txt: writes to file in format "fpr # uid"
-write_group() {
-    local group="$1"; shift
+# fun: set_conf_value string
+# param: string: "alias list (37)" formatted value. see GPGCONF(1)
+# txt: sets the value fo the groups config output
+set_conf_value() {
+    printf 'group:0:%s' "$1" |
+        gpgconf --change-options gpg
+}
 
-    if (( $# > 0 )); then
-        list_keys "$@" |
-            valid_fpr_uid |
-            sort |
-            uniq -w 40 |
-            sort -k2 |
-            sed 's/ / # /' > "$homedir/$group"
-    else
-        true > "$homedir/$group"
+# fun: build_conf_value
+# glo: group_names member_lists
+# txt: builds "alias list (37)" formatted value from current state
+#      see GPGCONF(1)
+build_conf_value()
+{
+    local i data;
+    for i in "${!group_names[@]}"; do
+        data+=$(printf '"%s = %s,' "${group_names[$i]}" "${member_lists[$i]}")
+    done
+    printf '%s' "${data%?}"
+}
+
+# fun: load_data
+# glo: group_names member_lists
+# txt: loads groups state from config file
+load_data()
+{
+    local name member_list cfg
+    cfg=$(get_conf_value)
+    while IFS=' =' read -rd, name member_list; do
+        group_names+=("${name:1}")
+        member_lists+=("$member_list")
+    done <<< "$cfg,"
+}
+
+# fun: write_data
+# txt: writes current group state to config
+write_data()
+{
+    local data revert
+
+    revert=$(get_conf_value)
+    data=$(build_conf_value)
+
+    if ! set_conf_value "$data" | cfg_ok ; then
+        set_conf_value "$revert"
+        err "Failed to update"
     fi
 }
+
+
+##################################################
+# Group State Methods
+##################################################
+
+# fun: get_group_id name
+# param: name: name of group
+# glo: group_names
+# txt: prints state index of named group
+get_group_id(){
+    local group=$1
+    for i in "${!group_names[@]}"; do
+        if [[ "$group" == "${group_names[$i]}" ]]; then
+            printf %s "$i"
+            return 0
+        fi
+    done
+    return 1
+}
+
+# fun: has_group name
+# param: name: name of group
+# txt: returns 1 if groups does not exist in state
+has_group()
+{
+    get_group_id "$1" > /dev/null
+}
+
+# fun: get_members group
+# param: group: name of group
+# glo: member_lists
+# txt: outputs fingerprints of group members
+get_members()
+{
+    local group=$1
+    local group_id
+
+    group_id=$(get_group_id "$group") || die "invalid group"
+    [[ -z "${member_lists[$group_id]}" ]] && return
+    while read -ra members; do
+        printf '%s\n' "${members[@]}"
+    done <<< "${member_lists[$group_id]}"
+}
+
+# fun: set_members group members
+# param: group: name of group
+# param: members to set
+# glo: member_lists
+# txt: set members of group in current state
+set_members()
+{
+    local group=$1
+    shift
+    local members=("$@")
+    local group_id
+
+    mapfile -t members < <(printf '%s\n' "${members[@]}" | sort -u)
+    group_id=$(get_group_id "$group")
+    member_lists[$group_id]=$(printf %s "${members[*]}")
+}
+
+# fun: add_member group member
+# param: group: name of group
+# param: member: fingerprint of member
+# txt: add a member to group in current state
+add_member()
+{
+    local group=$1
+    local member=$2
+    local members
+
+    mapfile -t members < <(get_members "$group")
+    members+=("$member")
+    set_members "$group" "${members[@]}"
+}
+
+# fun: remove_member group member
+# param: group: name of group
+# param: member: fingerprint of member
+# txt: remove a member from group in current state
+remove_member()
+{
+    local group=$1
+    local member=$2
+    local members i
+
+    mapfile -t members < <(get_members "$group")
+
+    for i in "${!members[@]}"; do
+        if [[ "$member" == "${members[$i]}" ]]; then
+            unset 'members[i]'
+            set_members "$group" "${members[@]}"
+            return 0
+        fi
+    done
+    return 1
+}
+
+# fun: add_group group
+# param: group: name of group
+# glo: group_names member_lists
+# txt: create a new group in current state
+add_group()
+{
+    local group=$1
+    if has_group "$group"; then
+        err "$group already exists"
+        return 1
+    fi
+    group_names+=("$group")
+    member_lists+=("")
+}
+
+# fun: remove_group group
+# param: group: name of group
+# glo: group_names member_lists
+# txt: remove a group form current state
+remove_group()
+{
+    local group=$1
+    local group_id
+
+    if ! group_id=$(get_group_id "$group"); then
+        err "$group does not exists"
+        return 1
+    fi
+    unset 'group_names[group_id]'
+    unset 'member_lists[group_id]'
+}
+
+# fun: is_clear
+# txt: does current state reflect whats persisted?
+is_clean()
+{
+    [[ "$(get_conf_value)" = "$(build_conf_value)" ]]
+}
+
+
+##################################################
+# GPG Key Methods
+##################################################
 
 # fun: list_keys query
 # param: query: query to search keys with
@@ -123,7 +404,7 @@ valid_fpr_uid() {
 }
 
 # fun: without_keys fingerprints
-# params: fingerprints to remove
+# param: fingerprints to remove
 # txt: reads fpr_uid format from stdin and remove entries for specififed
 #      fingerprints
 without_keys() {
@@ -146,35 +427,18 @@ fpr() {
     cut -d" " -f 1
 }
 
-# fun: is_clean group selected
-# param: group: name of group to check
-# param: selected: currently selected fingerprints
-# txt: returns 1 if selected differs from group on disk
-is_clean() {
-    local group="$1";
-    shift
-    diff -q <(read_group "$group" | sort ) \
-        <( (($#)) && printf '%s\n' "$@" | sort) > /dev/null
-}
 
 ##################################################
 # Commands
 ##################################################
 
-# fun: cmd_usage
-# txt: print usage to stdout
-cmd_usage() {
-    echo "usage"
-}
-
 # fun: cmd_groups
+# glo: group_names
 # txt: list all available groups
 cmd_groups() {
-    local group;
-    for group in "$homedir"/*; do
-        printf '%s\n' "${group##*/}"
-    done;
+    printf '%s\n' "${group_names[@]}"
 }
+
 
 # fun: cmd_show [-f] group
 # opt: -f: change output to fingerprints instead of uids
@@ -185,37 +449,11 @@ cmd_show() {
         then display=fpr; shift; else display=uid;
     fi
     group=$(pick_group "$1")
-    mapfile -t selected < <(read_group "$group")
-    (( ${#selected[@]} > 0 )) && list_keys "${selected[@]}" | valid_fpr_uid | $display
+    mapfile -t selected < <(get_members "$group")
+    (( ${#selected[@]} > 0 )) &&
+        list_keys "${selected[@]}" | valid_fpr_uid | $display
 }
 
-# fun: cmd_prune [-n] group
-# opt: -n: dont save changes
-# param: group: the group to prune
-# txt: rmeoves expired fingerprints from group
-cmd_prune() {
-    noact=false
-    if [[ "$1" = "-n" ]]; then
-        noact=true; shift
-    fi
-
-    group=$(pick_group "$1")
-
-    mapfile -t selected < <(read_group "$group")
-    mapfile -t active < <(cmd_show -f "$group")
-
-    (( "${#selected[@]}" == "${#active[@]}" )) && return 1
-
-    for s in "${selected[@]}"; do
-        for a in "${active[@]}"; do
-            [[ "$s" = "$a" ]] && continue 2
-        done
-
-        printf '%s\n' "$s"
-
-    done
-    $noact || write_group "$group" "${selected[@]}"
-}
 
 # fun: cmd_edit group
 # param: group: group to edit
@@ -223,15 +461,15 @@ cmd_prune() {
 cmd_edit() {
     group=$(pick_group "$1")
 
-    mapfile -t selected < <(read_group "$group")
-
     menu="[A]dd, [S]ave, [C]opy, [D]elete, [Q]uit: "
 
     while true; do
 
+        mapfile -t selected < <(get_members "$group")
+
         # determine if group has been saved since editing
-        if is_clean "$group" "${selected[@]}"
-            then dirty=""; else dirty="*"
+        if is_clean; then
+            dirty=""; else dirty="*"
         fi
 
         # header
@@ -247,31 +485,35 @@ cmd_edit() {
 
         # launch menu
         if fpr=$(pick_key "${keys[@]}"); then
-            # Remove fpr from group
-            for s in "${!selected[@]}"; do
-                [[ ${selected[$s]} = "$fpr" ]] && unset 'selected[s]'
-            done
+            remove_member "$group" "$fpr"
         else
             # Launch other action
-            case "$fpr" in
+            action="$fpr"
+            case "$action" in
                 A|a) # Search for and add FPR to group
                     read -r -p 'Search [type "C" to cancel]: ' query
                     [[ "$query" == "C" ]] && continue;
-                    found=$(list_keys "$query" | valid_fpr_uid | without_keys "${selected[@]}")
-                    PS3="Add to $group [C to cancel]: "
-                    fpr=$(pick_key "${found[@]}") && selected+=("$fpr")
+                    found=$(list_keys "$query" |
+                        valid_fpr_uid | without_keys "${selected[@]}")
+                    if [[ ! -z "$found" ]]; then
+                        PS3="Add to $group [C to cancel]: "
+                        fpr=$(pick_key "${found[@]}") && add_member "$group" "$fpr"
+                    else
+                        printf 'No valid key found for "%s"\n' "$query" >&2
+                    fi
                     ;;
                 S|s) # Save group
-                    write_group "$group" "${selected[@]}"
+                    write_data
                     ;;
                 Q|q) # Quit
-                    is_clean "$group" "${selected[@]}" && exit
+                    is_clean && exit
                     read -r -p 'Changes not saved! Are you sure? [y/N]: '
                     [[ "$REPLY" = 'y' ]] && exit
                     ;;
                 D|d) # Delete group
                     read -r -p "Delete $group? [y/N]: "
-                    [[ "$REPLY" = 'y' ]] && rm "$homedir/$group" && exit
+                    [[ "$REPLY" = 'y' ]] && remove_group "$group" &&
+                        write_data && exit
                     ;;
                 C|c) # Copy group
                     name=''
@@ -279,7 +521,8 @@ cmd_edit() {
                         read -r -p "Enter name for new group copy: " name
                         has_group "$name" && unset name
                     done
-                    write_group "$name" "${selected[@]}"
+                    add_group "$name"
+                    set_members "$name" "$(get_members "$group")"
                     ;;
                 *) printf 'Invalid Choice\n';
             esac
@@ -287,6 +530,7 @@ cmd_edit() {
         printf '\n'
     done;
 }
+
 
 # fun: cmd_new name
 # param: group: name of new group
@@ -298,127 +542,30 @@ cmd_new() {
         name=$1
     fi
     has_group "$name" && die "Group '$name' already exists"
-    touch "$homedir/$name"
+    add_group "$name"
     cmd_edit "$name"
 }
 
-cmd_encrypt() {
-
-    groups=()
-
-    while :; do
-        case "$1" in
-            -g)
-                if [ "$2" ]; then
-                    groups+=("$2")
-                    shift
-                else
-                    die '"--group" requires a non-empty option argument.'
-                fi
-                ;;
-            --group=?*)
-                group+=("${1#*=}")
-                ;;
-            --group=)
-                die '"--group" requires a non-empty option argument.'
-                ;;
-            --)  shift ; break ;;
-            -?*) printf 'WARN: Unknown option (ignored): %s\n' "$1" >&2 ;;
-            *)   break
-        esac
-        shift
-    done
-
-    for g in "${!groups[@]}"; do
-        if ! has_group "${groups[$g]}"; then
-            printf 'Invalid group %s\n' "${groups[$g]}" >&2
-            unset 'groups[g]'
-        fi
-    done
-
-    if (( "${#groups[@]}" < 1 )); then
-        die "No groups. Aborting"
-    fi
-
-    rcpt=()
-    for group in "${groups[@]}"; do
-        while read -r line; do
-            [[ -z "$line" ]] || rcpt+=("$line")
-        done < <(read_group "$group")
-    done
-
-    ((${#rcpt[@]})) && mapfile -t rcpt < <(printf '%s\n' "${rcpt[@]}" | sort | uniq)
-
-    if (( "${#rcpt[@]}" < 1 )); then
-        die "No recipients. Aborting"
-    fi
-
-    rcpt_flags=( "${rcpt[@]/#/-r }" )
-
-    for file in "$@"; do
-        if [[ -d "$file" ]]; then
-            archive="${file%/}".zip
-            output="$archive".gpg
-            zip -r - "$file" |
-                gpg --set-filename "$archive" -e "${rcpt_flags[@]}" -o "$output"
-        else
-            output="${file%/}".gpg
-            gpg -e "${rcpt_flags[@]}" -o "$output" "$file"
-        fi
-    done
-}
 
 ##################################################
 # Main
 ##################################################
 
+gpgconf --check-programs | grep ^gpg | cfg_ok ||
+    die "GPG has problems"
 
-## Global options
-verbose=0
-XDG_DATA_HOME="${XDG_DATA_HOME:-$HOME/.local/share}"
-homedir="${GPG_GROUPS:-$XDG_DATA_HOME/gpg-groups}"
-
-gpg="$(command -v gpg || command -v gpg2)"
-if [[ -z ${gpg} && ! -x ${gpg} ]] ; then die "GnuPG is not available" ; fi
-
-while :; do
-    case "$1" in
-        -v|--verbose) verbose=$((verbose + 1)) ;; # Each -v adds 1 to verbosity.
-        --homedir)
-            if [ "$2" ]; then
-                homedir=$2
-                shift
-            else
-                die '"--homedir" requires a non-empty option argument.'
-            fi
-            ;;
-        --homedir=?*)
-            homedir=${1#*=}
-            ;;
-        --homedir=)
-            die '"--homedir" requires a non-empty option argument.'
-            ;;
-        --)  shift ; break ;;
-        -?*) printf 'WARN: Unknown option (ignored): %s\n' "$1" >&2 ;;
-        *)   break
-    esac
-    shift
-done
-
-if [[ ! -d "$homedir" ]]; then
-    mkdir -p "$homedir"
-fi
+load_data
 
 cmd="$1"
 shift
 
 case "$cmd" in
+    -h|--help|help) show_help ;;
     groups)   cmd_groups ;;
     show)     cmd_show "$@";;
     edit)     cmd_edit "$@";;
     new)      cmd_new "$@";;
-    encrypt)  cmd_encrypt "$@";;
-    prune)    cmd_prune "$@";;
-    *) cmd_usage ;;
+    *) show_help ;;
 esac
+
 
