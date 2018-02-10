@@ -1,5 +1,17 @@
 #!/usr/bin/env bash
+#
+# Manage and encrypt to groups of Gnupg keys
+#
 
+
+##################################################
+# User Interface
+##################################################
+
+
+# fun: die message
+# param: message: the message to ouptut to stdout
+# txt: prints to stdout and exits w/ 1
 die() {
 	echo "gpg-group: ERROR: ${FUNCNAME[1]}: $1" >&2
 	exit 1
@@ -9,6 +21,10 @@ die() {
 # Methods
 ##################################################
 
+# fun: pick_group group
+# param: group: group to pick
+# txt: interactively prompts for group if none selected,
+#      and validates that group exists
 pick_group()
 {
     local group="$1"
@@ -23,6 +39,11 @@ pick_group()
     printf "%s" "$group"
 }
 
+# fun: pick_key fpr_uids
+# param: fpr_uids: "fingerprint uid" lines to choose from
+# txt: interactive menu to select a fingerprint.
+#      presents uids, outputs a fingerprint or other selection
+#      returns 0 if fpr selected, or 1 if other selection
 pick_key() {
     local fprs uids choice i
 
@@ -50,14 +71,24 @@ pick_key() {
     return 1
 }
 
+# fun: has_group group
+# param: group: group to check for existence
+# txt: checks if group exists
 has_group() {
     [[ -f "$homedir/$1" ]]
 }
 
+# fun: read_group group
+# param: group: group to read keys from
+# txt: outputs fingerprints from group. removes comments and blank lines
 read_group() {
     sed -e 's/#.*//g' -e '/^$/d' -e 's/[[:space:]]//g' < "$homedir/$1"
 }
 
+# fun: write_group group fingerprints
+# param: group: group name
+# param: fingerprints: fingerprints of group
+# txt: writes to file in format "fpr # uid"
 write_group() {
     local group="$1"; shift
 
@@ -73,17 +104,28 @@ write_group() {
     fi
 }
 
+# fun: list_keys query
+# param: query: query to search keys with
+# txt: outputs gpg public keys in --with-colons format
 list_keys() {
     gpg --list-public-keys --with-colons --with-fingerprint "$@"
 }
 
+# fun: valid_fpr_uid
+# txt: reads --with-colons format from stdin and outputs "fpr uid" format of
+#      valid keys and uid
 valid_fpr_uid() {
     awk -F: '
         /^pub:/{ VALID = $2};
         /^fpr:/{ FPR = $10 };
-        /^uid:/{ if(VALID != "e" && $2 != "e") {print FPR " " $10;} ; }'
+        /^uid:/{ if(VALID~/[^ner]/ && $2~/[^ner]/) {print FPR " " $10;} ; }
+        '
 }
 
+# fun: without_keys fingerprints
+# params: fingerprints to remove
+# txt: reads fpr_uid format from stdin and remove entries for specififed
+#      fingerprints
 without_keys() {
     if (("$#")) ; then
         grep -vf <(printf '^%s\n' "$@")
@@ -92,16 +134,25 @@ without_keys() {
     fi
 }
 
+# fun: uid
+# txt: reads fpr_uid format from stdin and outputs uid
 uid() {
     cut -d" " -f 2-
 }
 
+# fun: fpr
+# txt: reads fpr_uid format from stdin and outputs fpr
 fpr() {
     cut -d" " -f 1
 }
 
+# fun: is_clean group selected
+# param: group: name of group to check
+# param: selected: currently selected fingerprints
+# txt: returns 1 if selected differs from group on disk
 is_clean() {
-    local group="$1"; shift
+    local group="$1";
+    shift
     diff -q <(read_group "$group" | sort ) \
         <( (($#)) && printf '%s\n' "$@" | sort) > /dev/null
 }
@@ -110,10 +161,14 @@ is_clean() {
 # Commands
 ##################################################
 
+# fun: cmd_usage
+# txt: print usage to stdout
 cmd_usage() {
     echo "usage"
 }
 
+# fun: cmd_groups
+# txt: list all available groups
 cmd_groups() {
     local group;
     for group in "$homedir"/*; do
@@ -121,6 +176,10 @@ cmd_groups() {
     done;
 }
 
+# fun: cmd_show [-f] group
+# opt: -f: change output to fingerprints instead of uids
+# param: group: name of group to show memebers of
+# txt: list members of a group, uid or fingerprint
 cmd_show() {
     if [[ "$1" = "-f" ]];
         then display=fpr; shift; else display=uid;
@@ -130,6 +189,10 @@ cmd_show() {
     (( ${#selected[@]} > 0 )) && list_keys "${selected[@]}" | valid_fpr_uid | $display
 }
 
+# fun: cmd_prune [-n] group
+# opt: -n: dont save changes
+# param: group: the group to prune
+# txt: rmeoves expired fingerprints from group
 cmd_prune() {
     noact=false
     if [[ "$1" = "-n" ]]; then
@@ -154,30 +217,44 @@ cmd_prune() {
     $noact || write_group "$group" "${selected[@]}"
 }
 
+# fun: cmd_edit group
+# param: group: group to edit
+# txt: launch interactive edit group dialog
 cmd_edit() {
     group=$(pick_group "$1")
 
     mapfile -t selected < <(read_group "$group")
 
     menu="[A]dd, [S]ave, [C]opy, [D]elete, [Q]uit: "
+
     while true; do
+
+        # determine if group has been saved since editing
         if is_clean "$group" "${selected[@]}"
             then dirty=""; else dirty="*"
         fi
+
+        # header
         printf 'Edit group "%s"%s (%s keys)\n' "$group" "$dirty" ${#selected[@]} >&2
-        keys=''; PS3="$menu"
-        if (("${#selected[@]}" > 1)); then
+
+        # config menu
+        keys='';
+        PS3="$menu"
+        if (("${#selected[@]}" > 0)); then
             keys=$(list_keys "${selected[@]}" | valid_fpr_uid)
             PS3="[#] Remove key, $menu"
         fi
+
+        # launch menu
         if fpr=$(pick_key "${keys[@]}"); then
             # Remove fpr from group
             for s in "${!selected[@]}"; do
                 [[ ${selected[$s]} = "$fpr" ]] && unset 'selected[s]'
             done
         else
+            # Launch other action
             case "$fpr" in
-                A|a) # Add fpr to group
+                A|a) # Search for and add FPR to group
                     read -r -p 'Search [type "C" to cancel]: ' query
                     [[ "$query" == "C" ]] && continue;
                     found=$(list_keys "$query" | valid_fpr_uid | without_keys "${selected[@]}")
@@ -211,6 +288,9 @@ cmd_edit() {
     done;
 }
 
+# fun: cmd_new name
+# param: group: name of new group
+# txt: creates new group and lunches interactive edit
 cmd_new() {
     if [[ -z "$1" ]]; then
         read -r -p "Enter name for new group: " name
