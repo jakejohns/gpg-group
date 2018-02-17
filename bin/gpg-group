@@ -253,6 +253,7 @@ write_data()
 # glo: group_names
 # txt: prints state index of named group
 get_group_id(){
+    local i
     local group=$1
     for i in "${!group_names[@]}"; do
         if [[ "$group" == "${group_names[$i]}" ]]; then
@@ -278,7 +279,7 @@ has_group()
 get_members()
 {
     local group=$1
-    local group_id
+    local group_id members
 
     group_id=$(get_group_id "$group") || die "invalid group"
     [[ -z "${member_lists[$group_id]}" ]] && return
@@ -473,7 +474,7 @@ cmd_edit() {
         fi
 
         # header
-        printf 'Edit group "%s"%s (%s keys)\n' "$group" "$dirty" ${#selected[@]} >&2
+        printf '\nEdit group "%s"%s (%s keys)\n' "$group" "$dirty" ${#selected[@]} >&2
 
         # config menu
         keys='';
@@ -506,14 +507,14 @@ cmd_edit() {
                     write_data
                     ;;
                 Q|q) # Quit
-                    is_clean && exit
+                    is_clean && return
                     read -r -p 'Changes not saved! Are you sure? [y/N]: '
-                    [[ "$REPLY" = 'y' ]] && exit
+                    [[ "$REPLY" = 'y' ]] && return
                     ;;
                 D|d) # Delete group
                     read -r -p "Delete $group? [y/N]: "
                     [[ "$REPLY" = 'y' ]] && remove_group "$group" &&
-                        write_data && exit
+                        write_data && return
                     ;;
                 C|c) # Copy group
                     name=''
@@ -547,17 +548,46 @@ cmd_new() {
 }
 
 
+# fun: cmd_interactive
+# txt: launch interactive mode
+cmd_interactive()
+{
+    while true; do
+        printf '\nEdit groups \n' >&2
+        PS3='Select group to edit, [N]ew group, [Q]uit: '
+        mapfile -t groups < <(cmd_groups);
+        select group in "${groups[@]}"; do
+            if [[ "$group" ]]; then
+                cmd_edit "$group"
+            elif [[ "$REPLY" =~ [nN] ]]; then
+                cmd_new
+            elif [[ "$REPLY" =~ [qQ] ]]; then
+                exit
+            fi
+            break
+        done
+    done
+}
+
+
 ##################################################
 # Main
 ##################################################
 
-gpgconf --check-programs | grep ^gpg | cfg_ok ||
-    die "GPG has problems"
+# check initial config
+gpgconf --check-programs | grep ^gpg |
+    cfg_ok || die "GPG has problems"
 
-load_data
+load_data # load current state of groups
+
+[[ -z "$1" ]] && {
+    cmd_interactive
+    exit
+}
 
 cmd="$1"
 shift
+
 
 case "$cmd" in
     -h|--help|help) show_help ;;
