@@ -8,6 +8,7 @@
 ##################################################
 group_names=()
 member_lists=()
+cur_members=()
 
 ##################################################
 # User Interface
@@ -119,12 +120,10 @@ err() {
 pick_group()
 {
     local group="$1"
-    local groups
 
     if [[ -z "$group" ]]; then
         PS3='Select group: '
-        mapfile -t groups < <(cmd_groups);
-        select group in "${groups[@]}"; do
+        select group in "${group_names[@]}"; do
             [[ "$group" ]] && break
         done
     fi
@@ -151,8 +150,8 @@ pick_key() {
         return 1;
     fi
 
-    mapfile -t fprs < <(fpr <<< "$1")
-    mapfile -t uids < <(uid <<< "$1")
+    while read -r line; do fprs+=("$line"); done < <(fpr <<< "$1")
+    while read -r line; do uids+=("$line"); done < <(uid <<< "$1")
 
     select choice in "${uids[@]}"; do
         [[ $choice ]] || break
@@ -284,7 +283,7 @@ get_members()
     group_id=$(get_group_id "$group") || die "invalid group"
     [[ -z "${member_lists[$group_id]}" ]] && return
     while read -ra members; do
-        printf '%s\n' "${members[@]}"
+        cur_members=("${members[@]}")
     done <<< "${member_lists[$group_id]}"
 }
 
@@ -296,13 +295,10 @@ get_members()
 set_members()
 {
     local group=$1
-    shift
-    local members=("$@")
     local group_id
 
-    mapfile -t members < <(printf '%s\n' "${members[@]}" | sort -u)
     group_id=$(get_group_id "$group")
-    member_lists[$group_id]=$(printf %s "${members[*]}")
+    member_lists[$group_id]=$(printf %s "${cur_members[*]}")
 }
 
 # fun: add_member group member
@@ -313,11 +309,10 @@ add_member()
 {
     local group=$1
     local member=$2
-    local members
 
-    mapfile -t members < <(get_members "$group")
-    members+=("$member")
-    set_members "$group" "${members[@]}"
+    get_members "$group"
+    cur_members+=("$member")
+    set_members "$group"
 }
 
 # fun: remove_member group member
@@ -328,14 +323,14 @@ remove_member()
 {
     local group=$1
     local member=$2
-    local members i
+    local i
 
-    mapfile -t members < <(get_members "$group")
+    get_members "$group"
 
-    for i in "${!members[@]}"; do
-        if [[ "$member" == "${members[$i]}" ]]; then
-            unset 'members[i]'
-            set_members "$group" "${members[@]}"
+    for i in "${!cur_members[@]}"; do
+        if [[ "$member" == "${cur_members[$i]}" ]]; then
+            unset 'cur_members[i]'
+            set_members "$group"
             return 0
         fi
     done
@@ -450,9 +445,9 @@ cmd_show() {
         then display=fpr; shift; else display=uid;
     fi
     group=$(pick_group "$1")
-    mapfile -t selected < <(get_members "$group")
-    (( ${#selected[@]} > 0 )) &&
-        list_keys "${selected[@]}" | valid_fpr_uid | $display
+    get_members "$group"
+    (( ${#cur_members[@]} > 0 )) &&
+        list_keys "${cur_members[@]}" | valid_fpr_uid | $display
 }
 
 
@@ -466,7 +461,7 @@ cmd_edit() {
 
     while true; do
 
-        mapfile -t selected < <(get_members "$group")
+        get_members "$group"
 
         # determine if group has been saved since editing
         if is_clean; then
@@ -474,13 +469,13 @@ cmd_edit() {
         fi
 
         # header
-        printf '\nEdit group "%s"%s (%s keys)\n' "$group" "$dirty" ${#selected[@]} >&2
+        printf '\nEdit group "%s"%s (%s keys)\n' "$group" "$dirty" ${#cur_members[@]} >&2
 
         # config menu
         keys='';
         PS3="$menu"
-        if (("${#selected[@]}" > 0)); then
-            keys=$(list_keys "${selected[@]}" | valid_fpr_uid)
+        if (("${#cur_members[@]}" > 0)); then
+            keys=$(list_keys "${cur_members[@]}" | valid_fpr_uid)
             PS3="[#] Remove key, $menu"
         fi
 
@@ -495,7 +490,7 @@ cmd_edit() {
                     read -r -p 'Search [type "C" to cancel]: ' query
                     [[ "$query" == "C" ]] && continue;
                     found=$(list_keys "$query" |
-                        valid_fpr_uid | without_keys "${selected[@]}")
+                        valid_fpr_uid | without_keys "${cur_members[@]}")
                     if [[ ! -z "$found" ]]; then
                         PS3="Add to $group [C to cancel]: "
                         fpr=$(pick_key "${found[@]}") && add_member "$group" "$fpr"
@@ -523,7 +518,8 @@ cmd_edit() {
                         has_group "$name" && unset name
                     done
                     add_group "$name"
-                    set_members "$name" "$(get_members "$group")"
+                    get_members "$group"
+                    set_members "$name"
                     ;;
                 *) printf 'Invalid Choice\n';
             esac
@@ -555,8 +551,7 @@ cmd_interactive()
     while true; do
         printf '\nEdit groups \n' >&2
         PS3='Select group to edit, [N]ew group, [Q]uit: '
-        mapfile -t groups < <(cmd_groups);
-        select group in "${groups[@]}"; do
+        select group in "${group_names[@]}"; do
             if [[ "$group" ]]; then
                 cmd_edit "$group"
             elif [[ "$REPLY" =~ [nN] ]]; then
